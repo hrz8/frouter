@@ -1,7 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 
-import type { Express, Request, Handler as ExpressHandler, ErrorRequestHandler } from 'express';
+import type { Express, Handler as ExpressHandler, ErrorRequestHandler } from 'express';
+import type { Context } from './context.js';
+import { requestCtx } from './context.js';
+import { applyTracingContext } from './middleware.js';
 
 type RouteLoaderParams = {
   dir: string;
@@ -20,24 +23,45 @@ export class AppError extends Error {
   }
 }
 
+type BaseResponse = {
+  data: any;
+  debug: {
+    traceId: string;
+    requestId: string;
+  };
+};
+
 export class SuccessResponse {
-  constructor(public data: any) {}
+  constructor(
+    private ctx: Context,
+    public data: any,
+  ) {}
+
+  respond(): BaseResponse {
+    return {
+      data: this.data,
+      debug: {
+        traceId: this.ctx.traceId,
+        requestId: this.ctx.requestId,
+      },
+    };
+  }
 }
 
-export type Handler = (req: Request) => Promise<SuccessResponse> | SuccessResponse;
+export type Handler = (ctx: Context) => Promise<SuccessResponse> | SuccessResponse;
 
-const wrapper =
+const endpointHandlerWrapper =
   (handler: Handler): ExpressHandler =>
   (req, res, next) => {
     try {
-      const response = handler(req);
+      const response = handler(requestCtx.getStore()!);
 
       if (response instanceof SuccessResponse) {
-        res.json(response);
+        res.json(response.respond());
         return;
       }
 
-      res.send(JSON.stringify(response));
+      res.send(response);
     } catch (error) {
       if (error instanceof AppError) {
         res.status(error.getStatus()).json({ message: error.message });
@@ -50,10 +74,12 @@ const wrapper =
     }
   };
 
-const errorHandler = (): ErrorRequestHandler => (err, req, res, next) => {
-  res.status(500).json({ message: 'Internal server error' });
-  next();
-};
+const errorHandlerWrapper =
+  (defaultErrorMessage: string): ErrorRequestHandler =>
+  (err, req, res, next) => {
+    res.status(500).json({ message: defaultErrorMessage });
+    next();
+  };
 
 async function register(app: Express, baseRoute: string, filePath: string): Promise<void> {
   const module: Record<string, unknown> = await import(filePath);
@@ -74,7 +100,7 @@ async function register(app: Express, baseRoute: string, filePath: string): Prom
 
     if (typeof module[method] === 'function' && typeof app[methodKey] === 'function') {
       const handler = module[method] as Handler;
-      app[methodKey](routePath, wrapper(handler));
+      app[methodKey](routePath, endpointHandlerWrapper(handler));
     }
   }
 }
@@ -103,9 +129,11 @@ async function load(app: Express, params: RouteLoaderParams): Promise<void> {
     throw new Error(`Route directory ${params.dir} does not exist`);
   }
 
+  app.use(applyTracingContext);
+
   await compile(app, params.dir, '');
 
-  app.use(errorHandler());
+  app.use(errorHandlerWrapper('Internal server error'));
 }
 
 export default { load };
